@@ -435,6 +435,12 @@ foreach ($m in $c.PageMediaSizeCapability) {
   if ($m.PageMediaSizeName -ne $null) { $list += [string]$m.PageMediaSizeName }
 }
 $o.papers = $list
+try {
+  Add-Type -AssemblyName System.Drawing
+  $ps = New-Object System.Drawing.Printing.PrinterSettings
+  $ps.PrinterName = $name
+  if ($ps.IsValid -and $ps.CanDuplex) { $o.duplex = $true }
+} catch {}
 $o | ConvertTo-Json -Compress`
 
 func defaultCaps() printerCaps {
