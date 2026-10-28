@@ -11,11 +11,11 @@ jobs:
       - run: go mod tidy
       - run: go install github.com/akavel/rsrc@latest
       - run: rsrc -ico icon.ico -o rsrc.syso
-      - run: go build -o PhonePrint.exe .
+      - run: go build -o QRPrint.exe .
         env:
           GOOS: windows
           GOARCH: amd64
       - uses: actions/upload-artifact@v4
         with:
-          name: PhonePrint-windows-amd64
-          path: PhonePrint.exe
+          name: QRPrint-windows-amd64
+          path: QRPrint.exe
