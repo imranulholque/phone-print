@@ -122,6 +122,7 @@ func cfgPath() string {
 		home, _ := os.UserHomeDir()
 		appData = filepath.Join(home, "AppData", "Roaming")
 	}
+	// folder name kept the same so the saved PIN is not lost
 	return filepath.Join(appData, "PhonePrint", "config.json")
 }
 
@@ -1000,11 +1001,11 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if kind == "pdf" && findSumatra() == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "PDF printing needs SumatraPDF.exe next to PhonePrint.exe on the PC", "code": "nosumatra"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "PDF printing needs SumatraPDF.exe next to QRPrint.exe on the PC", "code": "nosumatra"})
 		return
 	}
 
-	tmp, err := os.CreateTemp("", "phoneprint-*"+ext)
+	tmp, err := os.CreateTemp("", "qrprint-*"+ext)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed", "code": "failed"})
 		return
@@ -1046,7 +1047,7 @@ func main() {
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		fmt.Printf("Port %d is already in use. Phone Print may already be running.\n", port)
+		fmt.Printf("Port %d is already in use. QR PRINT may already be running.\n", port)
 		fmt.Println("Opening the settings page...")
 		openBrowser(adminURL)
 		time.Sleep(3 * time.Second)
@@ -1073,7 +1074,7 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	fmt.Println("Phone Print is running.")
+	fmt.Println("QR PRINT is running.")
 	fmt.Println("Settings page: " + adminURL)
 	if u := phoneURL(); u != "" {
 		fmt.Println("Phone address: " + u)
@@ -1092,7 +1093,7 @@ func main() {
 const adminHTML = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Phone Print - Settings</title>
+<title>QR PRINT - Settings</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px}
@@ -1111,7 +1112,7 @@ button{width:100%;padding:10px;border:none;border-radius:6px;background:#2563eb;
 .ok{color:#4ade80}.err{color:#f87171}
 .small{font-size:.8rem;color:#94a3b8;margin-top:8px}
 </style></head><body><div class="c">
-<h1>Phone Print</h1>
+<h1>QR PRINT</h1>
 <div class="card qr"><h2>Scan with your phone</h2>
 <img id="qr" alt="QR code"><div class="url" id="url"></div></div>
 <div class="card"><h2>Printing</h2>
@@ -1121,7 +1122,7 @@ button{width:100%;padding:10px;border:none;border-radius:6px;background:#2563eb;
 <input type="password" id="pw" maxlength="4" inputmode="numeric" placeholder="4 digits" autocomplete="off">
 <button id="save">Save PIN</button><div class="msg" id="msg2"></div></div>
 <div class="card"><h2>PDF printing</h2><div id="sum" class="small"></div></div>
-<div class="small">Only PDF files and photos (JPG, PNG, BMP) can be printed. Close the black console window to stop Phone Print.</div>
+<div class="small">Only PDF files and photos (JPG, PNG, BMP) can be printed. Close the black console window to stop QR PRINT.</div>
 </div>
 <script>
 var H={'X-Requested-With':'PhonePrint','Content-Type':'application/json'};
@@ -1131,7 +1132,7 @@ function load(){
     $('en').checked=s.enabled;
     $('pwstate').textContent=s.hasPassword?'PIN is set.':'Set a PIN first.';
     $('url').textContent=s.url||'No Wi-Fi address found';
-    $('sum').textContent=s.sumatra?'SumatraPDF found. PDF printing is ready.':'SumatraPDF.exe not found. Put it in the same folder as PhonePrint.exe to print PDFs. Photos work without it.';
+    $('sum').textContent=s.sumatra?'SumatraPDF found. PDF printing is ready.':'SumatraPDF.exe not found. Put it in the same folder as QRPrint.exe to print PDFs. Photos work without it.';
     $('sum').style.color=s.sumatra?'#4ade80':'#fbbf24';
     if(s.url){$('qr').src='/admin/qr.png?'+Date.now();$('qr').style.display='inline-block'}else{$('qr').style.display='none'}
   });
@@ -1159,7 +1160,7 @@ load();
 const phoneHTML = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Phone Print</title>
+<title>QR PRINT</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
@@ -1204,7 +1205,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 </style></head><body>
 
 <div id="main"><div class="c">
-<h1>Phone Print</h1>
+<h1>QR PRINT</h1>
 <label class="pick">Choose files to print<input type="file" id="file" multiple accept="application/pdf,image/jpeg,image/png,image/bmp"></label>
 <div class="hint">PDF or photos (JPG, PNG)</div>
 <div id="files"></div>
@@ -1246,7 +1247,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 </div></div>
 
 <div id="lock" class="overlay" style="display:none"><div class="c">
-<h1>Phone Print</h1>
+<h1>QR PRINT</h1>
 <div class="hint" style="font-size:1rem;margin-bottom:14px">Enter the 4-digit PIN</div>
 <input type="password" id="pin" class="pin" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off">
 <button id="unlock" class="btn" type="button">Unlock</button>
@@ -1254,7 +1255,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 </div></div>
 
 <div id="off" class="overlay" style="display:none"><div class="c">
-<h1>Phone Print</h1>
+<h1>QR PRINT</h1>
 <div class="msg err" style="font-size:1.05rem;margin-bottom:16px">Printing is turned off on the PC.</div>
 <button id="retry" class="btn" type="button">Try again</button>
 </div></div>
@@ -1425,7 +1426,7 @@ function buildOpts(){
   clampCopies();
   // messages
   if(kindOf(S.cur)==='pdf'&&!S.pdfOk){
-    setMsg('dmsg','PDF printing needs SumatraPDF.exe next to PhonePrint.exe on the PC.','err');
+    setMsg('dmsg','PDF printing needs SumatraPDF.exe next to QRPrint.exe on the PC.','err');
     $('doprint').disabled=true;
   }else{
     setMsg('dmsg',c.detected?'':'Could not read this printer\'s features. Showing common options.',c.detected?'':'info');
