@@ -13,6 +13,7 @@ import (
 	"image/jpeg"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -458,6 +459,9 @@ try {
   $ps = New-Object System.Drawing.Printing.PrinterSettings
   $ps.PrinterName = $name
   if ($ps.IsValid -and $ps.CanDuplex) { $o.duplex = $true }
+  $fl = @()
+  foreach ($s in $ps.PaperSizes) { $fl += @{ n = [string]$s.PaperName; w = [int]$s.Width; h = [int]$s.Height } }
+  $o.forms = $fl
 } catch {}
 $o | ConvertTo-Json -Compress`
 
@@ -513,10 +517,85 @@ func queryCaps(printer string) printerCaps {
 			c.Papers = append(c.Papers, paperByEnum[name])
 		}
 	}
+	// every paper size known to the Windows print queue, including custom sizes
+	// added in the printer driver (for example a custom A6)
+	if fl, ok := raw["forms"].([]interface{}); ok {
+		have2 := map[string]bool{}
+		for _, p := range c.Papers {
+			have2[p.ID] = true
+		}
+		customN := 0
+		for _, it := range fl {
+			m, ok := it.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["n"].(string)
+			wf, _ := m["w"].(float64)
+			hf, _ := m["h"].(float64)
+			wmm, hmm := wf*0.254, hf*0.254
+			if wmm < 20 || hmm < 20 {
+				continue
+			}
+			if std, found := matchStdPaper(wmm, hmm); found {
+				if !have2[std.ID] {
+					c.Papers = append(c.Papers, std)
+					have2[std.ID] = true
+				}
+				continue
+			}
+			if customN >= 30 || name == "" {
+				continue
+			}
+			c.Papers = append(c.Papers, paperInfo{
+				ID:    fmt.Sprintf("custom%d", customN),
+				Label: fmt.Sprintf("%s (%.0fx%.0f mm)", name, wmm, hmm),
+				W:     math.Round(wmm*10) / 10,
+				H:     math.Round(hmm*10) / 10,
+			})
+			customN++
+		}
+	}
 	if !c.Color && !c.Mono {
 		c.Color, c.Mono = true, true
 	}
 	return c
+}
+
+// matchStdPaper finds the standard paper (A3, A4, Letter...) with the same size
+func matchStdPaper(wmm, hmm float64) (paperInfo, bool) {
+	for _, k := range paperOrder {
+		p := paperByEnum[k]
+		if (math.Abs(wmm-p.W) < 2 && math.Abs(hmm-p.H) < 2) || (math.Abs(wmm-p.H) < 2 && math.Abs(hmm-p.W) < 2) {
+			return p, true
+		}
+	}
+	return paperInfo{}, false
+}
+
+// sumatraPaper gives the paper name SumatraPDF understands. Custom sizes work
+// only when their size equals a standard paper (for example a custom A6).
+func sumatraPaper(id string, c printerCaps) (string, bool) {
+	switch id {
+	case "A3", "A4", "A5", "A6", "letter", "legal", "tabloid", "statement":
+		return id, true
+	}
+	for _, p := range c.Papers {
+		if p.ID == id {
+			if std, ok := matchStdPaper(p.W, p.H); ok {
+				return std.ID, true
+			}
+		}
+	}
+	return "", false
+}
+
+func pdfPaperOK(o printOpts, c printerCaps) bool {
+	if o.Paper == "" {
+		return true
+	}
+	_, ok := sumatraPaper(o.Paper, c)
+	return ok
 }
 
 func getCaps(printer string) printerCaps {
@@ -614,7 +693,9 @@ func sumatraSettings(o printOpts, c printerCaps) string {
 		p = append(p, "color")
 	}
 	if o.Paper != "" {
-		p = append(p, "paper="+o.Paper)
+		if sp, ok := sumatraPaper(o.Paper, c); ok {
+			p = append(p, "paper="+sp)
+		}
 	}
 	switch o.Duplex {
 	case "long":
@@ -1051,6 +1132,12 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if kind == "pdf" && !pdfPaperOK(o, caps) {
+		os.Remove(tmpPath)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This custom paper size works only for photos. For PDFs choose a standard size (A4, A5, A6...).", "code": "paper"})
+		return
+	}
+
 	printMu.Lock()
 	perr := printFile(printer, tmpPath, kind, o, caps)
 	printMu.Unlock()
@@ -1232,11 +1319,14 @@ func handlePrintBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o := req.Opts
-	o.Pages = "" // page ranges only make sense for one file
+	o := req.Opts // o.Pages (like 1-3,5) counts the pages of the joined document
 	caps := getCaps(req.Printer)
 	if msg, code := normalizeOpts(&o, caps); msg != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg, "code": code})
+		return
+	}
+	if !pdfPaperOK(o, caps) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This custom paper size works only for photos. For joined printing choose a standard size (A4, A5, A6...).", "code": "paper"})
 		return
 	}
 
@@ -1494,6 +1584,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 .bth{width:44px;height:44px;object-fit:cover;border-radius:4px;background:#fff;flex:none}
 .bpdf{background:#7c3aed;color:#fff;font-size:.75rem;display:flex;align-items:center;justify-content:center}
 .bnm{flex:1;min-width:0;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bnm small{display:block;color:#94a3b8;font-size:.75rem}
 .lbl{font-size:.8rem;color:#94a3b8;margin:4px 0 4px;display:flex;justify-content:space-between;align-items:center}
 .mini{background:none;border:none;color:#38bdf8;font-size:.8rem}
 .seg{display:flex;gap:8px;margin-bottom:10px}
@@ -1566,7 +1657,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <script>
 var PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
 var MAXPV=20;
-var S={session:'',files:[],cur:null,batch:false,bUrls:[],caps:null,color:'color',pdfOk:true,pdfDoc:null,imgW:0,imgH:0,pvUrl:''};
+var S={session:'',files:[],cur:null,batch:false,bUrls:[],bCounts:[],bLbl:[],bTok:null,caps:null,color:'color',pdfOk:true,pdfDoc:null,imgW:0,imgH:0,pvUrl:''};
 try{S.session=sessionStorage.getItem('pp_s')||''}catch(e){}
 
 function $(i){return document.getElementById(i)}
@@ -1708,13 +1799,14 @@ function openBatch(){
   $('dtitle').textContent='Print all together ('+S.files.length+' files)';
   resetDlg();
   $('pdfonly').style.display=needPdf()?'block':'none';
-  $('pagesrow').style.display='none';
+  $('pagesrow').style.display='block';
+  $('pages').value='';
   $('copLbl').textContent='Copies (whole set)';
   $('doprint').textContent='Print all';
   renderBatchPreview();
   loadPrinters();
 }
-$('dclose').onclick=function(){$('dlg').style.display='none';clearPreview();S.cur=null;S.batch=false};
+$('dclose').onclick=function(){$('dlg').style.display='none';clearPreview();S.cur=null;S.batch=false;S.bTok=null};
 
 function loadPrinters(){
   setMsg('dmsg','Looking for printers...','info');
@@ -1825,7 +1917,8 @@ function startPreview(){
 }
 function renderBatchPreview(){
   var pv=$('pv');pv.innerHTML='';
-  S.bUrls=[];
+  for(var k=0;k<S.bUrls.length;k++){URL.revokeObjectURL(S.bUrls[k])}
+  S.bUrls=[];S.bLbl=[];S.bCounts=[];
   S.files.forEach(function(f,i){
     var row=el('div','brow');
     row.appendChild(el('div','bnum',String(i+1)));
@@ -1834,13 +1927,60 @@ function renderBatchPreview(){
       var u=URL.createObjectURL(f);S.bUrls.push(u);
       im.loading='lazy';im.className='bth';im.src=u;
       row.appendChild(im);
+      S.bCounts.push(1);
     }else{
       row.appendChild(el('div','bth bpdf','PDF'));
+      S.bCounts.push(null);
     }
-    row.appendChild(el('div','bnm',f.name));
+    var nm=el('div','bnm',f.name);
+    var lb=el('small','','');
+    nm.appendChild(lb);S.bLbl.push(lb);
+    row.appendChild(nm);
     pv.appendChild(row);
   });
+  updateRanges();
+  // count the pages of each PDF one by one, so page numbers can be shown
+  var tok={};S.bTok=tok;
+  function next(i){
+    if(S.bTok!==tok||i>=S.files.length)return;
+    if(S.bCounts[i]!==null){next(i+1);return}
+    pdfCount(S.files[i],function(n){
+      if(S.bTok!==tok)return;
+      S.bCounts[i]=n;updateRanges();next(i+1);
+    });
+  }
+  next(0);
   updatePreview();
+}
+function updateRanges(){
+  var pos=1,known=true;
+  for(var i=0;i<S.files.length;i++){
+    var n=S.bCounts[i],lb=S.bLbl[i];
+    if(!lb)continue;
+    if(known&&n!==null&&n!==undefined){
+      lb.textContent=(n===1)?('page '+pos):('pages '+pos+'\u2013'+(pos+n-1));
+      pos+=n;
+    }else{known=false;lb.textContent=''}
+  }
+  S.bTotal=known?(pos-1):0;
+  if(S.batch&&$('pvnote'))updatePreview();
+}
+function pdfCount(f,cb){
+  function go(){
+    var fr=new FileReader();
+    fr.onload=function(){
+      try{
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc=PDFJS+'pdf.worker.min.js';
+        window.pdfjsLib.getDocument({data:new Uint8Array(fr.result)}).promise.then(function(p){
+          var n=p.numPages;cb(n);
+        }).catch(function(){cb(null)});
+      }catch(e){cb(null)}
+    };
+    fr.onerror=function(){cb(null)};
+    fr.readAsArrayBuffer(f);
+  }
+  if(window.pdfjsLib){go()}
+  else{loadScript(PDFJS+'pdf.min.js',function(ok){if(ok&&window.pdfjsLib){go()}else{cb(null)}})}
 }
 function paperDims(){
   var id=$('paper').value;
@@ -1873,7 +2013,7 @@ function renderImagePreview(){
 function updatePreview(){
   $('pv').className='pv'+(S.color==='mono'?' gray':'');
   if(S.batch){
-    $('pvnote').textContent=S.files.length+' files joined into one print job, in this order \u00b7 '+noteText();
+    $('pvnote').textContent=S.files.length+' files joined into one print job'+(S.bTotal?' ('+S.bTotal+' pages)':'')+' \u00b7 '+noteText();
     return;
   }
   if(!S.cur)return;
@@ -1945,10 +2085,15 @@ function printBatch(){
     duplex:S.caps.duplex?$('duplex').value:'none',
     orientation:$('orient').value,
     scale:$('scale').value,
-    pages:''
+    pages:$('pages').value.replace(/\s+/g,'')
   };
   if(o.copies<1)o.copies=1;
   if(o.copies>S.caps.maxCopies){setMsg('dmsg','Maximum copies: '+S.caps.maxCopies,'err');return}
+  if(o.pages&&!/^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$/.test(o.pages)){setMsg('dmsg','Pages: use a format like 1-3,5','err');return}
+  if(o.pages&&S.bTotal){
+    var nums=o.pages.match(/[0-9]+/g)||[];
+    for(var q=0;q<nums.length;q++){if(parseInt(nums[q],10)>S.bTotal){setMsg('dmsg','The joined document has only '+S.bTotal+' pages.','err');return}}
+  }
   var printer=$('printer').value;
   var ids=[];
   $('doprint').disabled=true;
