@@ -87,13 +87,27 @@ type paperInfo struct {
 	H     float64 `json:"h"`
 }
 
+type sourceInfo struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// the driver's own default settings (what you see in Printing Preferences)
+type capsDefaults struct {
+	Duplex string `json:"duplex"`
+	Paper  string `json:"paper"`
+	Source string `json:"source"`
+}
+
 type printerCaps struct {
-	Detected  bool        `json:"detected"`
-	Color     bool        `json:"color"`
-	Mono      bool        `json:"mono"`
-	Duplex    bool        `json:"duplex"`
-	MaxCopies int         `json:"maxCopies"`
-	Papers    []paperInfo `json:"papers"`
+	Detected  bool         `json:"detected"`
+	Color     bool         `json:"color"`
+	Mono      bool         `json:"mono"`
+	Duplex    bool         `json:"duplex"`
+	MaxCopies int          `json:"maxCopies"`
+	Papers    []paperInfo  `json:"papers"`
+	Sources   []sourceInfo `json:"sources"`
+	Defaults  capsDefaults `json:"defaults"`
 }
 
 type capsEntry struct {
@@ -109,6 +123,7 @@ type printOpts struct {
 	Orientation string `json:"orientation"`
 	Scale       string `json:"scale"`
 	Pages       string `json:"pages"`
+	Source      string `json:"source"`
 }
 
 // a file uploaded by the phone that is waiting for "Print all together"
@@ -462,12 +477,20 @@ try {
   $fl = @()
   foreach ($s in $ps.PaperSizes) { $fl += @{ n = [string]$s.PaperName; w = [int]$s.Width; h = [int]$s.Height } }
   $o.forms = $fl
+  $fs = @()
+  foreach ($s in $ps.PaperSources) { $fs += @{ n = [string]$s.SourceName; k = [int]$s.RawKind } }
+  $o.sources = $fs
+  $dp = $ps.DefaultPageSettings
+  $o.defDuplex = [string]$ps.Duplex
+  $o.defW = [int]$dp.PaperSize.Width
+  $o.defH = [int]$dp.PaperSize.Height
+  $o.defSrc = [int]$dp.PaperSource.RawKind
 } catch {}
 $o | ConvertTo-Json -Compress`
 
 func defaultCaps() printerCaps {
 	return printerCaps{
-		Detected: false, Color: true, Mono: true, Duplex: false, MaxCopies: 999,
+		Detected: false, Color: true, Mono: true, Duplex: true, MaxCopies: 999, Sources: []sourceInfo{},
 		Papers: []paperInfo{paperByEnum["ISOA4"], paperByEnum["NorthAmericaLetter"]},
 	}
 }
@@ -556,6 +579,51 @@ func queryCaps(printer string) printerCaps {
 			customN++
 		}
 	}
+	// paper sources (drawers, bypass...) and the driver's current default settings
+	c.Sources = []sourceInfo{}
+	if fs, ok := raw["sources"].([]interface{}); ok {
+		seenSrc := map[string]bool{}
+		for _, it := range fs {
+			m, ok := it.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["n"].(string)
+			k, _ := m["k"].(float64)
+			id := strconv.Itoa(int(k))
+			if name == "" || seenSrc[id] {
+				continue
+			}
+			seenSrc[id] = true
+			c.Sources = append(c.Sources, sourceInfo{ID: id, Label: name})
+		}
+	}
+	switch ds, _ := raw["defDuplex"].(string); ds {
+	case "Vertical":
+		c.Defaults.Duplex = "long"
+	case "Horizontal":
+		c.Defaults.Duplex = "short"
+	default:
+		c.Defaults.Duplex = "none"
+	}
+	if dw, ok := raw["defW"].(float64); ok {
+		dh, _ := raw["defH"].(float64)
+		wmm, hmm := dw*0.254, dh*0.254
+		for _, p := range c.Papers {
+			if math.Abs(wmm-p.W) < 2 && math.Abs(hmm-p.H) < 2 {
+				c.Defaults.Paper = p.ID
+				break
+			}
+		}
+	}
+	if dk, ok := raw["defSrc"].(float64); ok {
+		id := strconv.Itoa(int(dk))
+		for _, sc := range c.Sources {
+			if sc.ID == id {
+				c.Defaults.Source = id
+			}
+		}
+	}
 	if !c.Color && !c.Mono {
 		c.Color, c.Mono = true, true
 	}
@@ -590,6 +658,34 @@ func sumatraPaper(id string, c printerCaps) (string, bool) {
 	return "", false
 }
 
+// sentSummary tells the phone exactly which settings were sent to the driver
+func sentSummary(o printOpts, c printerCaps) string {
+	paper := "printer default paper"
+	for _, p := range c.Papers {
+		if p.ID == o.Paper {
+			paper = p.Label
+		}
+	}
+	col := "color"
+	if o.Color == "mono" {
+		col = "black & white"
+	}
+	d := "one-sided"
+	switch o.Duplex {
+	case "long":
+		d = "two-sided (long edge)"
+	case "short":
+		d = "two-sided (short edge)"
+	}
+	src := "default tray"
+	for _, sc := range c.Sources {
+		if sc.ID == o.Source {
+			src = sc.Label
+		}
+	}
+	return fmt.Sprintf("%s, %s, %s, %s, copies: %d", paper, col, d, src, o.Copies)
+}
+
 func pdfPaperOK(o printOpts, c printerCaps) bool {
 	if o.Paper == "" {
 		return true
@@ -606,9 +702,14 @@ func getCaps(printer string) printerCaps {
 	}
 	capsMu.Unlock()
 	c := queryCaps(printer)
-	capsMu.Lock()
-	capsCache[printer] = capsEntry{caps: c, at: time.Now()}
-	capsMu.Unlock()
+	if !c.Detected {
+		c = queryCaps(printer)
+	}
+	if c.Detected {
+		capsMu.Lock()
+		capsCache[printer] = capsEntry{caps: c, at: time.Now()}
+		capsMu.Unlock()
+	}
 	return c
 }
 
@@ -661,6 +762,12 @@ try {
   }
   if ($env:FB_DUPLEX -eq 'long') { $pd.PrinterSettings.Duplex = [System.Drawing.Printing.Duplex]::Vertical }
   elseif ($env:FB_DUPLEX -eq 'short') { $pd.PrinterSettings.Duplex = [System.Drawing.Printing.Duplex]::Horizontal }
+  else { $pd.PrinterSettings.Duplex = [System.Drawing.Printing.Duplex]::Simplex }
+  if ($env:FB_SRC) {
+    foreach ($src in $pd.PrinterSettings.PaperSources) {
+      if ([string]$src.RawKind -eq $env:FB_SRC) { $pd.DefaultPageSettings.PaperSource = $src; break }
+    }
+  }
   $land = $false
   if ($env:FB_ORIENT -eq 'landscape') { $land = $true }
   elseif ($env:FB_ORIENT -eq 'auto') { $land = ($global:img.Width -gt $global:img.Height) }
@@ -684,9 +791,7 @@ func sumatraSettings(o printOpts, c printerCaps) string {
 	if o.Pages != "" {
 		p = append(p, o.Pages)
 	}
-	if o.Copies > 1 {
-		p = append(p, strconv.Itoa(o.Copies)+"x")
-	}
+	p = append(p, strconv.Itoa(o.Copies)+"x")
 	if o.Color == "mono" {
 		p = append(p, "monochrome")
 	} else {
@@ -697,15 +802,17 @@ func sumatraSettings(o printOpts, c printerCaps) string {
 			p = append(p, "paper="+sp)
 		}
 	}
+	if o.Source != "" {
+		p = append(p, "bin="+o.Source)
+	}
+	// always send the duplex choice, so the driver default never decides
 	switch o.Duplex {
 	case "long":
 		p = append(p, "duplexlong")
 	case "short":
 		p = append(p, "duplexshort")
 	default:
-		if c.Duplex {
-			p = append(p, "simplex")
-		}
+		p = append(p, "simplex")
 	}
 	switch o.Orientation {
 	case "portrait":
@@ -746,6 +853,7 @@ func printFile(printer, path, kind string, o printOpts, c printerCaps) error {
 			"FB_PH=" + ph,
 			"FB_DUPLEX=" + o.Duplex,
 			"FB_ORIENT=" + o.Orientation,
+			"FB_SRC=" + o.Source,
 		}
 		cmd = psCmd(ctx, imagePrintScript, env)
 	case "pdf":
@@ -753,7 +861,9 @@ func printFile(printer, path, kind string, o printOpts, c printerCaps) error {
 		if s == "" {
 			return fmt.Errorf("SumatraPDF not found")
 		}
-		cmd = exec.CommandContext(ctx, s, "-print-to", printer, "-print-settings", sumatraSettings(o, c), "-silent", path)
+		settings := sumatraSettings(o, c)
+		log.Printf("SumatraPDF settings: %s", settings)
+		cmd = exec.CommandContext(ctx, s, "-print-to", printer, "-print-settings", settings, "-silent", path)
 		hideWindow(cmd)
 	default:
 		return fmt.Errorf("unsupported file type")
@@ -802,6 +912,14 @@ func normalizeOpts(o *printOpts, c printerCaps) (string, string) {
 	if o.Color == "mono" && !c.Mono {
 		o.Color = "color"
 	}
+	if o.Paper == "" && len(c.Papers) > 0 {
+		o.Paper = c.Papers[0].ID
+		for _, p := range c.Papers {
+			if p.ID == "A4" {
+				o.Paper = "A4"
+			}
+		}
+	}
 	if o.Paper != "" {
 		found := false
 		for _, p := range c.Papers {
@@ -813,10 +931,33 @@ func normalizeOpts(o *printOpts, c printerCaps) (string, string) {
 			return "That paper size is not available on this printer", "paper"
 		}
 	}
+	if o.Source != "" {
+		found := false
+		for _, sc := range c.Sources {
+			if sc.ID == o.Source {
+				found = true
+			}
+		}
+		if !found {
+			if len(c.Sources) > 0 {
+				return "That paper source is not available on this printer", "source"
+			}
+			o.Source = ""
+		}
+	}
+	if o.Source == "" && len(c.Sources) > 0 {
+		o.Source = c.Sources[0].ID
+		for _, sc := range c.Sources {
+			if strings.Contains(strings.ToLower(sc.Label), "auto") {
+				o.Source = sc.ID
+				break
+			}
+		}
+	}
 	if o.Duplex != "long" && o.Duplex != "short" {
 		o.Duplex = "none"
 	}
-	if !c.Duplex {
+	if c.Detected && !c.Duplex {
 		o.Duplex = "none"
 	}
 	if o.Orientation != "portrait" && o.Orientation != "landscape" {
@@ -1149,7 +1290,7 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Printed a %s file on %q (%d copies)", kind, printer, o.Copies)
-	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "sent": sentSummary(o, caps)})
 }
 
 // ---------- "Print all together" ----------
@@ -1408,7 +1549,7 @@ func handlePrintBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Printed one job made of %d files on %q (%d copies)", len(items), req.Printer, o.Copies)
-	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "sent": sentSummary(o, caps)})
 }
 
 // ---------- main ----------
@@ -1618,6 +1759,9 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <div class="lbl"><span>Paper size</span></div>
 <select id="paper"></select>
 
+<div id="srcrow" style="display:none"><div class="lbl"><span>Paper source (tray)</span></div>
+<select id="source"></select></div>
+
 <div class="lbl"><span id="copLbl">Copies</span></div>
 <div class="cop"><button id="cm" type="button">&#8722;</button><input id="copies" class="num" type="number" min="1" value="1" inputmode="numeric"><button id="cp" type="button">+</button></div>
 
@@ -1657,7 +1801,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <script>
 var PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
 var MAXPV=20;
-var S={session:'',files:[],cur:null,batch:false,bUrls:[],bCounts:[],bLbl:[],bTok:null,caps:null,color:'color',pdfOk:true,pdfDoc:null,imgW:0,imgH:0,pvUrl:''};
+var S={session:'',files:[],cur:null,batch:false,bUrls:[],bCounts:[],bLbl:[],bTok:null,defApplied:false,caps:null,color:'color',pdfOk:true,pdfDoc:null,imgW:0,imgH:0,pvUrl:''};
 try{S.session=sessionStorage.getItem('pp_s')||''}catch(e){}
 
 function $(i){return document.getElementById(i)}
@@ -1773,6 +1917,7 @@ $('printAll').onclick=function(){openBatch()};
 
 /* ---------- print dialog ---------- */
 function resetDlg(){
+  S.defApplied=false;
   setMsg('dmsg','','');
   $('dlg').style.display='block';
   $('copies').value=1;
@@ -1829,7 +1974,7 @@ function loadPrinters(){
   });
 }
 $('refp').onclick=loadPrinters;
-$('printer').onchange=loadCaps;
+$('printer').onchange=function(){S.defApplied=false;loadCaps()};
 
 function loadCaps(){
   var name=$('printer').value;if(!name)return;
@@ -1847,14 +1992,27 @@ function buildOpts(){
   var c=S.caps,i;
   // paper sizes
   var ps=$('paper'),prev=ps.value;ps.innerHTML='';
-  var d0=el('option','','Printer default');d0.value='';ps.appendChild(d0);
   c.papers.forEach(function(p){var o=el('option','',p.label);o.value=p.id;if(p.id===prev)o.selected=true;ps.appendChild(o)});
+  if(!prev||!ps.querySelector('option[value="'+prev+'"]')){
+    var pick=c.papers.length?c.papers[0].id:'';
+    for(var pi=0;pi<c.papers.length;pi++){if(c.papers[pi].id==='A4')pick='A4'}
+    ps.value=pick;
+  }
   // color
   if(!((S.color==='color'&&c.color)||(S.color==='mono'&&c.mono)))S.color=c.color?'color':'mono';
   renderColor();
   // two-sided
-  $('duprow').style.display=c.duplex?'block':'none';
-  if(!c.duplex)$('duplex').value='none';
+  $('duprow').style.display=(c.detected&&!c.duplex)?'none':'block';
+  if(c.detected&&!c.duplex)$('duplex').value='none';
+  // paper source (tray)
+  var sr=$('source'),sprev=sr.value;sr.innerHTML='';
+  (c.sources||[]).forEach(function(sc){var o=el('option','',sc.label);o.value=sc.id;sr.appendChild(o)});
+  var spick='';
+  (c.sources||[]).forEach(function(sc){if(!spick&&/auto/i.test(sc.label))spick=sc.id});
+  if(!spick&&c.sources&&c.sources.length)spick=c.sources[0].id;
+  if(sprev&&sr.querySelector('option[value="'+sprev+'"]'))sr.value=sprev;else sr.value=spick;
+  $('srcrow').style.display=(c.sources&&c.sources.length)?'block':'none';
+  S.defApplied=true;
   // copies
   $('copies').max=c.maxCopies;
   clampCopies();
@@ -2082,7 +2240,8 @@ function printBatch(){
     copies:parseInt($('copies').value,10)||1,
     color:S.color,
     paper:$('paper').value,
-    duplex:S.caps.duplex?$('duplex').value:'none',
+    duplex:$('duplex').value,
+    source:$('source').value,
     orientation:$('orient').value,
     scale:$('scale').value,
     pages:$('pages').value.replace(/\s+/g,'')
@@ -2102,7 +2261,7 @@ function printBatch(){
   function fin(c,d,pre){
     $('doprint').disabled=false;
     $('dclose').disabled=false;
-    if(c===200){setMsg('dmsg','All '+files.length+' files sent to the printer.','ok')}
+    if(c===200){setMsg('dmsg','All '+files.length+' files sent: '+(d.sent||'ok'),'ok')}
     else if(c===0){setMsg('dmsg','Network error.','err')}
     else if(c===401||c===403){setMsg('dmsg','','')}
     else{setMsg('dmsg',d.error||pre||'Printing failed.','err')}
@@ -2140,7 +2299,8 @@ $('doprint').onclick=function(){
     copies:parseInt($('copies').value,10)||1,
     color:S.color,
     paper:$('paper').value,
-    duplex:S.caps.duplex?$('duplex').value:'none',
+    duplex:$('duplex').value,
+    source:$('source').value,
     orientation:$('orient').value,
     scale:$('scale').value,
     pages:isPdf?$('pages').value.replace(/\s+/g,''):''
@@ -2156,7 +2316,7 @@ $('doprint').onclick=function(){
     progress:function(e){if(e.lengthComputable)setMsg('dmsg','Sending... '+Math.round(e.loaded/e.total*100)+'%','info')}
   },function(c,d){
     $('doprint').disabled=false;
-    if(c===200){setMsg('dmsg','Sent to the printer.','ok')}
+    if(c===200){setMsg('dmsg','Sent: '+(d.sent||'ok'),'ok')}
     else if(c===0){setMsg('dmsg','Network error.','err')}
     else if(c===401||c===403){setMsg('dmsg','','')}
     else{setMsg('dmsg',d.error||'Printing failed.','err')}
