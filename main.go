@@ -797,11 +797,6 @@ func sumatraSettings(o printOpts, c printerCaps) string {
 	} else {
 		p = append(p, "color")
 	}
-	if o.Paper != "" {
-		if sp, ok := sumatraPaper(o.Paper, c); ok {
-			p = append(p, "paper="+sp)
-		}
-	}
 	if o.Source != "" {
 		p = append(p, "bin="+o.Source)
 	}
@@ -828,48 +823,220 @@ func sumatraSettings(o printOpts, c printerCaps) string {
 	return strings.Join(p, ",")
 }
 
-func printFile(printer, path, kind string, o printOpts, c printerCaps) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
+// queueHead finds the print queue (local or shared \\server\printer)
+const queueHead = `Add-Type -AssemblyName System.Printing
+$name = $env:FB_PRINTER
+$q = $null
+try {
+  $srv = New-Object System.Printing.LocalPrintServer
+  $q = $srv.GetPrintQueue($name)
+} catch {
+  $q = $null
+}
+if ($q -eq $null -and $name.StartsWith('\\')) {
+  $parts = $name.TrimStart([char]92).Split([char[]]@([char]92), 2)
+  $srv2 = New-Object System.Printing.PrintServer(('\\' + $parts[0]))
+  $q = $srv2.GetPrintQueue($parts[1])
+}
+`
 
-	var cmd *exec.Cmd
-	switch kind {
-	case "image":
-		pw, ph := "", ""
-		if o.Paper != "" {
-			for _, pp := range c.Papers {
-				if pp.ID == o.Paper {
-					pw = strconv.FormatFloat(pp.W, 'f', -1, 64)
-					ph = strconv.FormatFloat(pp.H, 'f', -1, 64)
-				}
+// applyScript writes the phone's choices into the driver's own defaults and
+// reads them back to check that the driver really accepted them.
+const applyScript = `$ErrorActionPreference = 'Stop'
+try {
+` + queueHead + `
+$q.Refresh()
+# back up the current driver defaults
+$ms = New-Object System.IO.MemoryStream
+$q.UserPrintTicket.SaveTo($ms)
+[System.IO.File]::WriteAllBytes($env:FB_BACKUP, $ms.ToArray())
+
+$t = $q.UserPrintTicket
+if ($env:FB_PAPER) {
+  $t.PageMediaSize = New-Object System.Printing.PageMediaSize([System.Printing.PageMediaSizeName]$env:FB_PAPER)
+} elseif ($env:FB_PW) {
+  $t.PageMediaSize = New-Object System.Printing.PageMediaSize(([double]$env:FB_PW * 96 / 25.4), ([double]$env:FB_PH * 96 / 25.4))
+}
+if ($env:FB_DUPLEX -eq 'long') { $t.Duplexing = [System.Printing.Duplexing]::TwoSidedLongEdge }
+elseif ($env:FB_DUPLEX -eq 'short') { $t.Duplexing = [System.Printing.Duplexing]::TwoSidedShortEdge }
+else { $t.Duplexing = [System.Printing.Duplexing]::OneSided }
+if ($env:FB_COLOR -eq 'mono') { $t.OutputColor = [System.Printing.OutputColor]::Monochrome }
+else { $t.OutputColor = [System.Printing.OutputColor]::Color }
+$t.CopyCount = 1
+
+try {
+  $r = $q.MergeAndValidatePrintTicket($t)
+  $q.UserPrintTicket = $r.ValidatedPrintTicket
+  $q.Commit()
+} catch {
+  throw ('Windows refused to change the driver settings (try running QRPrint as Administrator): ' + $_.Exception.Message)
+}
+
+# read back and verify
+$q.Refresh()
+$v = $q.UserPrintTicket
+$bad = @()
+if ($env:FB_PAPER -or $env:FB_PW) {
+  $okPaper = $false
+  if ($env:FB_PAPER -and ([string]$v.PageMediaSize.PageMediaSizeName -eq $env:FB_PAPER)) { $okPaper = $true }
+  if ($env:FB_PW) {
+    $ew = [double]$env:FB_PW * 96 / 25.4
+    $eh = [double]$env:FB_PH * 96 / 25.4
+    $gw = [double]$v.PageMediaSize.Width
+    $gh = [double]$v.PageMediaSize.Height
+    if ((([Math]::Abs($gw - $ew) -lt 8) -and ([Math]::Abs($gh - $eh) -lt 8)) -or (([Math]::Abs($gw - $eh) -lt 8) -and ([Math]::Abs($gh - $ew) -lt 8))) { $okPaper = $true }
+  }
+  if (-not $okPaper) { $bad += ('paper is ' + $v.PageMediaSize.PageMediaSizeName) }
+}
+$wantD = 'OneSided'
+if ($env:FB_DUPLEX -eq 'long') { $wantD = 'TwoSidedLongEdge' } elseif ($env:FB_DUPLEX -eq 'short') { $wantD = 'TwoSidedShortEdge' }
+$gotD = [string]$v.Duplexing
+if ($gotD -ne $wantD) {
+  # a printer without duplex may report Unknown for one-sided: that is fine
+  if (-not ($wantD -eq 'OneSided' -and $gotD -eq 'Unknown')) { $bad += ('duplex is ' + $gotD) }
+}
+if ($bad.Count -gt 0) { throw ('Driver did not accept: ' + ($bad -join ', ')) }
+'OK'
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}`
+
+const restoreScript = `$ErrorActionPreference = 'Stop'
+try {
+` + queueHead + `
+$bytes = [System.IO.File]::ReadAllBytes($env:FB_BACKUP)
+$ms = New-Object System.IO.MemoryStream(,$bytes)
+$q.UserPrintTicket = New-Object System.Printing.PrintTicket($ms)
+$q.Commit()
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}`
+
+var psErrRe = regexp.MustCompile(`(?s)<S S="Error">(.*?)</S>`)
+
+// cleanPSOutput turns PowerShell's error output into plain readable text
+func cleanPSOutput(b []byte) string {
+	s := string(b)
+	if strings.Contains(s, "#< CLIXML") {
+		var parts []string
+		for _, m := range psErrRe.FindAllStringSubmatch(s, -1) {
+			t := strings.ReplaceAll(m[1], "_x000D__x000A_", " ")
+			t = strings.TrimSpace(t)
+			if t != "" {
+				parts = append(parts, t)
 			}
 		}
-		env := []string{
-			"FB_FILE=" + path,
-			"FB_PRINTER=" + printer,
-			"FB_COPIES=" + strconv.Itoa(o.Copies),
-			"FB_COLOR=" + o.Color,
-			"FB_PW=" + pw,
-			"FB_PH=" + ph,
-			"FB_DUPLEX=" + o.Duplex,
-			"FB_ORIENT=" + o.Orientation,
-			"FB_SRC=" + o.Source,
+		s = strings.Join(parts, " ")
+	}
+	return strings.TrimSpace(s)
+}
+
+func enumForPaper(id string) string {
+	for k, p := range paperByEnum {
+		if p.ID == id {
+			return k
 		}
-		cmd = psCmd(ctx, imagePrintScript, env)
+	}
+	return ""
+}
+
+// applyDriver writes the phone's choices into the printer driver and checks them.
+func applyDriver(printer string, o printOpts, c printerCaps, backup string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	env := []string{"FB_PRINTER=" + printer, "FB_BACKUP=" + backup,
+		"FB_DUPLEX=" + o.Duplex, "FB_COLOR=" + o.Color}
+	if o.Paper != "" {
+		pw, ph := 0.0, 0.0
+		for _, p := range c.Papers {
+			if p.ID == o.Paper {
+				pw, ph = p.W, p.H
+			}
+		}
+		e := enumForPaper(o.Paper)
+		if e != "" {
+			env = append(env, "FB_PAPER="+e)
+			if pw == 0 {
+				pw, ph = paperByEnum[e].W, paperByEnum[e].H
+			}
+		}
+		if pw > 0 {
+			env = append(env,
+				"FB_PW="+strconv.FormatFloat(pw, 'f', -1, 64),
+				"FB_PH="+strconv.FormatFloat(ph, 'f', -1, 64))
+		}
+	}
+	out, err := psCmd(ctx, applyScript, env).CombinedOutput()
+	if err != nil {
+		msg := cleanPSOutput(out)
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
+func restoreDriver(printer, backup string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	if out, err := psCmd(ctx, restoreScript, []string{"FB_PRINTER=" + printer, "FB_BACKUP=" + backup}).CombinedOutput(); err != nil {
+		log.Printf("Could not restore driver settings: %v %s", err, cleanPSOutput(out))
+	}
+	os.Remove(backup)
+}
+
+// printFile prints everything through SumatraPDF. Photos are first turned into
+// a one-page PDF, so there is one printing path. Before printing, the driver's
+// own defaults are set and verified; afterwards the old defaults come back.
+func printFile(printer, path, kind string, o printOpts, c printerCaps) error {
+	s := findSumatra()
+	if s == "" {
+		return fmt.Errorf("SumatraPDF not found")
+	}
+	switch kind {
+	case "image":
+		work, err := os.MkdirTemp("", "qrprint-img-*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(work)
+		jpg := filepath.Join(work, "a.jpg")
+		pdf := filepath.Join(work, "a.pdf")
+		if err := normalizeImage(path, jpg); err != nil {
+			return err
+		}
+		pw, ph := 210.0, 297.0
+		for _, p := range c.Papers {
+			if p.ID == o.Paper {
+				pw, ph = p.W, p.H
+			}
+		}
+		if err := jpegToPDF(jpg, pdf, pw, ph, o.Orientation); err != nil {
+			return err
+		}
+		path = pdf
 	case "pdf":
-		s := findSumatra()
-		if s == "" {
-			return fmt.Errorf("SumatraPDF not found")
-		}
-		settings := sumatraSettings(o, c)
-		log.Printf("SumatraPDF settings: %s", settings)
-		cmd = exec.CommandContext(ctx, s, "-print-to", printer, "-print-settings", settings, "-silent", path)
-		hideWindow(cmd)
 	default:
 		return fmt.Errorf("unsupported file type")
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+
+	backup := filepath.Join(os.TempDir(), "qrprint-ticket-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".xml")
+	if err := applyDriver(printer, o, c, backup); err != nil {
+		os.Remove(backup)
+		return err // nothing is printed with wrong settings
+	}
+	defer restoreDriver(printer, backup)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	settings := sumatraSettings(o, c)
+	log.Printf("Driver set and verified. SumatraPDF settings: %s", settings)
+	cmd := exec.CommandContext(ctx, s, "-print-to", printer, "-print-settings", settings, "-silent", path)
+	hideWindow(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -1273,12 +1440,6 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if kind == "pdf" && !pdfPaperOK(o, caps) {
-		os.Remove(tmpPath)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This custom paper size works only for photos. For PDFs choose a standard size (A4, A5, A6...).", "code": "paper"})
-		return
-	}
-
 	printMu.Lock()
 	perr := printFile(printer, tmpPath, kind, o, caps)
 	printMu.Unlock()
@@ -1286,7 +1447,7 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 
 	if perr != nil {
 		log.Printf("Print failed on %q: %v", printer, perr)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed. Please check the printer.", "code": "failed"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed: " + perr.Error(), "code": "failed"})
 		return
 	}
 	log.Printf("Printed a %s file on %q (%d copies)", kind, printer, o.Copies)
@@ -1466,10 +1627,6 @@ func handlePrintBatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg, "code": code})
 		return
 	}
-	if !pdfPaperOK(o, caps) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "This custom paper size works only for photos. For joined printing choose a standard size (A4, A5, A6...).", "code": "paper"})
-		return
-	}
 
 	// take the staged files (only the ones uploaded by this phone session)
 	session := r.Header.Get("X-Session")
@@ -1545,7 +1702,7 @@ func handlePrintBatch(w http.ResponseWriter, r *http.Request) {
 
 	if perr != nil {
 		log.Printf("Batch print failed on %q: %v", req.Printer, perr)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed. Please check the printer.", "code": "failed"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed: " + perr.Error(), "code": "failed"})
 		return
 	}
 	log.Printf("Printed one job made of %d files on %q (%d copies)", len(items), req.Printer, o.Copies)
