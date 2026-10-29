@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"log"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/pdfcpu/pdfcpu/pkg/api"
 	qrcode "github.com/skip2/go-qrcode"
 )
 
@@ -37,6 +39,10 @@ const (
 	globalFailLim  = 20
 	sessionIdle    = 30 * time.Minute
 	maxSessions    = 100
+
+	// "Print all together" limits
+	maxStaged    = 50               // files waiting for a batch at the same time
+	stageTTL     = 30 * time.Minute // uploaded batch files are deleted after this
 )
 
 var (
@@ -54,6 +60,9 @@ var (
 
 	capsMu    sync.Mutex
 	capsCache = map[string]capsEntry{}
+
+	stageMu sync.Mutex
+	staging = map[string]*staged{}
 )
 
 type config struct {
@@ -99,6 +108,14 @@ type printOpts struct {
 	Orientation string `json:"orientation"`
 	Scale       string `json:"scale"`
 	Pages       string `json:"pages"`
+}
+
+// a file uploaded by the phone that is waiting for "Print all together"
+type staged struct {
+	path    string
+	kind    string
+	session string
+	at      time.Time
 }
 
 var paperOrder = []string{"ISOA3", "ISOA4", "ISOA5", "ISOA6", "NorthAmericaLetter", "NorthAmericaLegal", "NorthAmericaTabloid", "NorthAmericaStatement"}
@@ -960,6 +977,44 @@ func handleCaps(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// saveUpload reads the request body into a temp file after checking that it is
+// a PDF or a photo. On failure it writes the error response and returns ok=false.
+func saveUpload(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxPrintBytes)
+	head := make([]byte, 8)
+	n, _ := io.ReadFull(r.Body, head)
+	head = head[:n]
+	kind, ext := sniffPrintType(head)
+	if kind == "" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Only PDF and photos can be printed", "code": "type"})
+		return "", "", false
+	}
+	if kind == "pdf" && findSumatra() == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "PDF printing needs SumatraPDF.exe next to QRPrint.exe on the PC", "code": "nosumatra"})
+		return "", "", false
+	}
+
+	tmp, err := os.CreateTemp("", "qrprint-*"+ext)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed", "code": "failed"})
+		return "", "", false
+	}
+	tmpPath := tmp.Name()
+
+	_, werr := tmp.Write(head)
+	if werr == nil {
+		_, werr = io.Copy(tmp, r.Body)
+	}
+	tmp.Close()
+	if werr != nil {
+		os.Remove(tmpPath)
+		log.Printf("Failed to receive print file: %v", werr)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Upload failed", "code": "upload"})
+		return "", "", false
+	}
+	return tmpPath, kind, true
+}
+
 func handlePrint(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -991,44 +1046,15 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxPrintBytes)
-	head := make([]byte, 8)
-	n, _ := io.ReadFull(r.Body, head)
-	head = head[:n]
-	kind, ext := sniffPrintType(head)
-	if kind == "" {
-		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Only PDF and photos can be printed", "code": "type"})
-		return
-	}
-	if kind == "pdf" && findSumatra() == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "PDF printing needs SumatraPDF.exe next to QRPrint.exe on the PC", "code": "nosumatra"})
-		return
-	}
-
-	tmp, err := os.CreateTemp("", "qrprint-*"+ext)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed", "code": "failed"})
-		return
-	}
-	tmpPath := tmp.Name()
-	remove := func() { os.Remove(tmpPath) }
-
-	_, werr := tmp.Write(head)
-	if werr == nil {
-		_, werr = io.Copy(tmp, r.Body)
-	}
-	tmp.Close()
-	if werr != nil {
-		remove()
-		log.Printf("Failed to receive print file: %v", werr)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Upload failed", "code": "upload"})
+	tmpPath, kind, got := saveUpload(w, r)
+	if !got {
 		return
 	}
 
 	printMu.Lock()
 	perr := printFile(printer, tmpPath, kind, o, caps)
 	printMu.Unlock()
-	remove()
+	os.Remove(tmpPath)
 
 	if perr != nil {
 		log.Printf("Print failed on %q: %v", printer, perr)
@@ -1036,6 +1062,262 @@ func handlePrint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Printed a %s file on %q (%d copies)", kind, printer, o.Copies)
+	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// ---------- "Print all together" ----------
+
+// cleanStaged deletes uploaded batch files that were never printed
+func cleanStaged() {
+	stageMu.Lock()
+	defer stageMu.Unlock()
+	now := time.Now()
+	for id, s := range staging {
+		if now.Sub(s.at) > stageTTL {
+			os.Remove(s.path)
+			delete(staging, id)
+		}
+	}
+}
+
+// handleStage receives one file of a batch and keeps it until /api/printbatch
+func handleStage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cleanStaged()
+	stageMu.Lock()
+	count := len(staging)
+	stageMu.Unlock()
+	if count >= maxStaged {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "Too many files waiting. Try again in a few minutes.", "code": "busy"})
+		return
+	}
+
+	path, kind, ok := saveUpload(w, r)
+	if !ok {
+		return
+	}
+	idb := make([]byte, 16)
+	if _, err := rand.Read(idb); err != nil {
+		os.Remove(path)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Upload failed", "code": "failed"})
+		return
+	}
+	id := hex.EncodeToString(idb)
+	stageMu.Lock()
+	staging[id] = &staged{path: path, kind: kind, session: r.Header.Get("X-Session"), at: time.Now()}
+	stageMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+// normImageScript turns any photo (JPG/PNG/BMP) into an upright, white-background
+// JPEG so it can be placed on a PDF page
+const normImageScript = `$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$img = [System.Drawing.Image]::FromFile($env:FB_FILE)
+try {
+  if ($img.PropertyIdList -contains 274) {
+    $o = $img.GetPropertyItem(274).Value[0]
+    if ($o -eq 3) { $img.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone) }
+    elseif ($o -eq 6) { $img.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipNone) }
+    elseif ($o -eq 8) { $img.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipNone) }
+  }
+  $bmp = New-Object System.Drawing.Bitmap($img.Width, $img.Height)
+  $bmp.SetResolution(96, 96)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.Clear([System.Drawing.Color]::White)
+  $g.DrawImage($img, 0, 0, $img.Width, $img.Height)
+  $g.Dispose()
+  $enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+  $p = New-Object System.Drawing.Imaging.EncoderParameters(1)
+  $p.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]92)
+  $bmp.Save($env:FB_OUT, $enc, $p)
+  $bmp.Dispose()
+} finally { $img.Dispose() }`
+
+func normalizeImage(src, dst string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	out, err := psCmd(ctx, normImageScript, []string{"FB_FILE=" + src, "FB_OUT=" + dst}).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// jpegToPDF writes a one-page PDF with the JPEG centred and fitted on the paper
+func jpegToPDF(jpgPath, pdfPath string, paperWmm, paperHmm float64, orient string) error {
+	data, err := os.ReadFile(jpgPath)
+	if err != nil {
+		return err
+	}
+	cfgImg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	iw0, ih0 := float64(cfgImg.Width), float64(cfgImg.Height)
+	pw, ph := paperWmm*72/25.4, paperHmm*72/25.4
+	land := orient == "landscape" || (orient == "auto" && iw0 > ih0)
+	if land {
+		pw, ph = ph, pw
+	}
+	const margin = 36.0
+	scale := (pw - 2*margin) / iw0
+	if s2 := (ph - 2*margin) / ih0; s2 < scale {
+		scale = s2
+	}
+	iw, ih := iw0*scale, ih0*scale
+	x, y := (pw-iw)/2, (ph-ih)/2
+
+	var buf bytes.Buffer
+	offs := make([]int, 6)
+	buf.WriteString("%PDF-1.4\n")
+	obj := func(n int, body string) {
+		offs[n] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", n, body)
+	}
+	obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+	obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	obj(3, fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>", pw, ph))
+	offs[4] = buf.Len()
+	fmt.Fprintf(&buf, "4 0 obj\n<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n", cfgImg.Width, cfgImg.Height, len(data))
+	buf.Write(data)
+	buf.WriteString("\nendstream\nendobj\n")
+	content := fmt.Sprintf("q %.2f 0 0 %.2f %.2f %.2f cm /Im0 Do Q", iw, ih, x, y)
+	offs[5] = buf.Len()
+	fmt.Fprintf(&buf, "5 0 obj\n<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(content), content)
+	xref := buf.Len()
+	buf.WriteString("xref\n0 6\n0000000000 65535 f \n")
+	for i := 1; i <= 5; i++ {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offs[i])
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xref)
+	return os.WriteFile(pdfPath, buf.Bytes(), 0600)
+}
+
+// handlePrintBatch joins all staged files (in the given order) into ONE PDF
+// and prints it as a single job. Each photo becomes one page, each PDF keeps
+// its pages, so two-sided printing continues onto the back of the page and
+// "Copies" gives complete sets.
+func handlePrintBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Printer string    `json:"printer"`
+		Ids     []string  `json:"ids"`
+		Opts    printOpts `json:"opts"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Ids) == 0 || len(req.Ids) > maxStaged {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Bad request", "code": "bad"})
+		return
+	}
+	if findSumatra() == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Print all together needs SumatraPDF.exe next to QRPrint.exe on the PC", "code": "nosumatra"})
+		return
+	}
+
+	ok, err := printerExists(req.Printer)
+	if err != nil {
+		log.Printf("Failed to list printers: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not read printers", "code": "failed"})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Printer not available", "code": "printer"})
+		return
+	}
+
+	o := req.Opts
+	o.Pages = "" // page ranges only make sense for one file
+	caps := getCaps(req.Printer)
+	if msg, code := normalizeOpts(&o, caps); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg, "code": code})
+		return
+	}
+
+	// take the staged files (only the ones uploaded by this phone session)
+	session := r.Header.Get("X-Session")
+	stageMu.Lock()
+	items := make([]*staged, 0, len(req.Ids))
+	seen := map[string]bool{}
+	for _, id := range req.Ids {
+		s, found := staging[id]
+		if !found || s.session != session || seen[id] {
+			stageMu.Unlock()
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "A file expired. Please try again.", "code": "expired"})
+			return
+		}
+		seen[id] = true
+		items = append(items, s)
+	}
+	for _, id := range req.Ids {
+		delete(staging, id)
+	}
+	stageMu.Unlock()
+	defer func() {
+		for _, it := range items {
+			os.Remove(it.path)
+		}
+	}()
+
+	work, err := os.MkdirTemp("", "qrprint-batch-*")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed", "code": "failed"})
+		return
+	}
+	defer os.RemoveAll(work)
+
+	// paper used for photo pages (A4 when the printer default is chosen)
+	pwmm, phmm := 210.0, 297.0
+	for _, pp := range caps.Papers {
+		if pp.ID == o.Paper {
+			pwmm, phmm = pp.W, pp.H
+		}
+	}
+
+	parts := make([]string, 0, len(items))
+	for i, it := range items {
+		if it.kind == "pdf" {
+			parts = append(parts, it.path)
+			continue
+		}
+		jpg := filepath.Join(work, fmt.Sprintf("p%03d.jpg", i))
+		pdf := filepath.Join(work, fmt.Sprintf("p%03d.pdf", i))
+		if err := normalizeImage(it.path, jpg); err != nil {
+			log.Printf("Could not prepare photo %d: %v", i+1, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("Could not read photo %d", i+1), "code": "failed"})
+			return
+		}
+		if err := jpegToPDF(jpg, pdf, pwmm, phmm, o.Orientation); err != nil {
+			log.Printf("Could not convert photo %d: %v", i+1, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("Could not convert photo %d", i+1), "code": "failed"})
+			return
+		}
+		parts = append(parts, pdf)
+	}
+
+	merged := filepath.Join(work, "merged.pdf")
+	if err := api.MergeCreateFile(parts, merged, false, nil); err != nil {
+		log.Printf("PDF merge failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not join the files. A PDF may be damaged or password-protected.", "code": "failed"})
+		return
+	}
+
+	printMu.Lock()
+	perr := printFile(req.Printer, merged, "pdf", o, caps)
+	printMu.Unlock()
+
+	if perr != nil {
+		log.Printf("Batch print failed on %q: %v", req.Printer, perr)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Printing failed. Please check the printer.", "code": "failed"})
+		return
+	}
+	log.Printf("Printed one job made of %d files on %q (%d copies)", len(items), req.Printer, o.Copies)
 	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
 
@@ -1062,6 +1344,8 @@ func main() {
 	mux.HandleFunc("/api/printers", phoneAuth(handlePrinters))
 	mux.HandleFunc("/api/caps", phoneAuth(handleCaps))
 	mux.HandleFunc("/api/print", phoneAuth(handlePrint))
+	mux.HandleFunc("/api/stage", phoneAuth(handleStage))
+	mux.HandleFunc("/api/printbatch", phoneAuth(handlePrintBatch))
 	mux.HandleFunc("/admin", adminOnly(handleAdminPage))
 	mux.HandleFunc("/admin/api/status", adminOnly(handleAdminStatus))
 	mux.HandleFunc("/admin/api/enable", adminOnly(handleAdminEnable))
@@ -1073,6 +1357,14 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+
+	// remove batch files that were uploaded but never printed
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			cleanStaged()
+		}
+	}()
 
 	fmt.Println("QR PRINT is running.")
 	fmt.Println("Settings page: " + adminURL)
@@ -1177,6 +1469,8 @@ h1{font-size:1.5rem;text-align:center;color:#38bdf8;margin-bottom:18px}
 .nm small{display:block;color:#94a3b8;font-size:.75rem}
 .pbtn{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:9px 16px;font-size:.95rem}
 .xbtn{background:none;border:none;color:#64748b;font-size:1.4rem;padding:0 6px}
+.xbtn.mv{font-size:1rem;padding:0 4px}
+.xbtn:disabled{opacity:.25}
 input.pin,select,input.txt,input.num{width:100%;padding:12px;margin-bottom:10px;border-radius:8px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;font-size:1rem}
 input.pin{text-align:center;letter-spacing:.6em;font-size:1.6rem}
 .msg{text-align:center;margin-top:12px;font-size:.95rem;min-height:1.3em}
@@ -1185,6 +1479,7 @@ input.pin{text-align:center;letter-spacing:.6em;font-size:1.6rem}
 #dlg{z-index:10}#lock{z-index:30}#off{z-index:30}
 .dhead{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .gbtn{background:#334155;color:#e2e8f0;border:none;border-radius:6px;padding:8px 12px;font-size:.95rem}
+.gbtn:disabled{opacity:.4}
 .dtitle{flex:1;min-width:0;font-size:.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pv{background:#334155;border-radius:8px;padding:12px;max-height:46vh;overflow-y:auto;-webkit-overflow-scrolling:touch}
 .pv.gray{filter:grayscale(1)}
@@ -1194,6 +1489,11 @@ input.pin{text-align:center;letter-spacing:.6em;font-size:1.6rem}
 .sheet{position:relative;width:100%;margin:0 auto;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}
 .sheet img{position:absolute;top:6%;left:6%;width:88%;height:88%;object-fit:contain}
 canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10px}
+.brow{display:flex;align-items:center;gap:10px;background:#1e293b;border-radius:6px;padding:6px 8px;margin-bottom:6px}
+.bnum{width:22px;height:22px;border-radius:11px;background:#2563eb;color:#fff;font-size:.8rem;display:flex;align-items:center;justify-content:center;flex:none}
+.bth{width:44px;height:44px;object-fit:cover;border-radius:4px;background:#fff;flex:none}
+.bpdf{background:#7c3aed;color:#fff;font-size:.75rem;display:flex;align-items:center;justify-content:center}
+.bnm{flex:1;min-width:0;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lbl{font-size:.8rem;color:#94a3b8;margin:4px 0 4px;display:flex;justify-content:space-between;align-items:center}
 .mini{background:none;border:none;color:#38bdf8;font-size:.8rem}
 .seg{display:flex;gap:8px;margin-bottom:10px}
@@ -1207,8 +1507,9 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <div id="main"><div class="c">
 <h1>QR PRINT</h1>
 <label class="pick">Choose files to print<input type="file" id="file" multiple accept="application/pdf,image/jpeg,image/png,image/bmp"></label>
-<div class="hint">PDF or photos (JPG, PNG)</div>
+<div class="hint">PDF or photos (JPG, PNG). Choose several to print them all together.</div>
 <div id="files"></div>
+<button id="printAll" class="btn green" type="button" style="display:none">Print all together</button>
 <div id="fmsg" class="msg"></div>
 </div></div>
 
@@ -1226,7 +1527,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <div class="lbl"><span>Paper size</span></div>
 <select id="paper"></select>
 
-<div class="lbl"><span>Copies</span></div>
+<div class="lbl"><span id="copLbl">Copies</span></div>
 <div class="cop"><button id="cm" type="button">&#8722;</button><input id="copies" class="num" type="number" min="1" value="1" inputmode="numeric"><button id="cp" type="button">+</button></div>
 
 <div id="duprow" style="display:none"><div class="lbl"><span>Two-sided</span></div>
@@ -1238,8 +1539,10 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <div id="pdfonly" style="display:none">
 <div class="lbl"><span>Scale</span></div>
 <select id="scale"><option value="fit">Fit to page</option><option value="noscale">Actual size</option></select>
+<div id="pagesrow">
 <div class="lbl"><span>Pages</span></div>
 <input id="pages" class="txt" type="text" placeholder="All pages (e.g. 1-3,5)" autocomplete="off">
+</div>
 </div>
 
 <button id="doprint" class="btn green" type="button" disabled>Print</button>
@@ -1263,7 +1566,7 @@ canvas.pg{display:block;width:100%;height:auto;background:#fff;margin:0 auto 10p
 <script>
 var PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
 var MAXPV=20;
-var S={session:'',files:[],cur:null,caps:null,color:'color',pdfOk:true,pdfDoc:null,imgW:0,imgH:0,pvUrl:''};
+var S={session:'',files:[],cur:null,batch:false,bUrls:[],caps:null,color:'color',pdfOk:true,pdfDoc:null,imgW:0,imgH:0,pvUrl:''};
 try{S.session=sessionStorage.getItem('pp_s')||''}catch(e){}
 
 function $(i){return document.getElementById(i)}
@@ -1271,6 +1574,10 @@ function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cl
 function setMsg(id,t,cls){var e=$(id);e.textContent=t||'';e.className='msg '+(cls||'')}
 function fmt(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
 function kindOf(f){return (/\.pdf$/i.test(f.name)||f.type==='application/pdf')?'pdf':'image'}
+function needPdf(){
+  if(S.batch)return true; // joined files are printed through SumatraPDF
+  return !!S.cur&&kindOf(S.cur)==='pdf';
+}
 
 function req(method,url,o,cb){
   o=o||{};
@@ -1344,35 +1651,70 @@ $('file').onchange=function(){
   setMsg('fmsg',bad?'Only PDF and photos (JPG, PNG, BMP) can be printed.':'','err');
   renderFiles();
 };
+function swapFiles(a,b){var t=S.files[a];S.files[a]=S.files[b];S.files[b]=t;renderFiles()}
 function renderFiles(){
   var box=$('files');box.innerHTML='';
+  var many=S.files.length>1;
   S.files.forEach(function(f,i){
     var row=el('div','row');
-    var nm=el('div','nm',f.name);
+    var nm=el('div','nm',(many?(i+1)+'. ':'')+f.name);
     nm.appendChild(el('small','',fmt(f.size)));
+    row.appendChild(nm);
+    if(many){
+      var up=el('button','xbtn mv','\u25b2');up.type='button';up.disabled=(i===0);
+      up.onclick=function(){swapFiles(i,i-1)};
+      var dn=el('button','xbtn mv','\u25bc');dn.type='button';dn.disabled=(i===S.files.length-1);
+      dn.onclick=function(){swapFiles(i,i+1)};
+      row.appendChild(up);row.appendChild(dn);
+    }
     var pb=el('button','pbtn','Print');pb.type='button';
     pb.onclick=function(){openDlg(f)};
     var xb=el('button','xbtn','\u00d7');xb.type='button';
     xb.onclick=function(){S.files.splice(i,1);renderFiles()};
-    row.appendChild(nm);row.appendChild(pb);row.appendChild(xb);
+    row.appendChild(pb);row.appendChild(xb);
     box.appendChild(row);
   });
+  var pa=$('printAll');
+  pa.style.display=many?'block':'none';
+  pa.textContent='Print all together ('+S.files.length+')';
 }
+$('printAll').onclick=function(){openBatch()};
 
 /* ---------- print dialog ---------- */
-function openDlg(f){
-  S.cur=f;S.caps=null;
-  $('dtitle').textContent=f.name;
+function resetDlg(){
   setMsg('dmsg','','');
   $('dlg').style.display='block';
-  $('pdfonly').style.display=kindOf(f)==='pdf'?'block':'none';
-  $('pages').value='';
   $('copies').value=1;
   $('doprint').disabled=true;
+  $('dclose').disabled=false;
+}
+function openDlg(f){
+  S.batch=false;S.cur=f;S.caps=null;
+  clearPreview();
+  $('dtitle').textContent=f.name;
+  resetDlg();
+  $('pdfonly').style.display=kindOf(f)==='pdf'?'block':'none';
+  $('pagesrow').style.display='block';
+  $('pages').value='';
+  $('copLbl').textContent='Copies';
+  $('doprint').textContent='Print';
   startPreview();
   loadPrinters();
 }
-$('dclose').onclick=function(){$('dlg').style.display='none';clearPreview();S.cur=null};
+function openBatch(){
+  if(S.files.length<2)return;
+  S.batch=true;S.cur=null;S.caps=null;
+  clearPreview();
+  $('dtitle').textContent='Print all together ('+S.files.length+' files)';
+  resetDlg();
+  $('pdfonly').style.display=needPdf()?'block':'none';
+  $('pagesrow').style.display='none';
+  $('copLbl').textContent='Copies (whole set)';
+  $('doprint').textContent='Print all';
+  renderBatchPreview();
+  loadPrinters();
+}
+$('dclose').onclick=function(){$('dlg').style.display='none';clearPreview();S.cur=null;S.batch=false};
 
 function loadPrinters(){
   setMsg('dmsg','Looking for printers...','info');
@@ -1425,7 +1767,7 @@ function buildOpts(){
   $('copies').max=c.maxCopies;
   clampCopies();
   // messages
-  if(kindOf(S.cur)==='pdf'&&!S.pdfOk){
+  if(needPdf()&&!S.pdfOk){
     setMsg('dmsg','PDF printing needs SumatraPDF.exe next to QRPrint.exe on the PC.','err');
     $('doprint').disabled=true;
   }else{
@@ -1463,6 +1805,8 @@ $('orient').onchange=updatePreview;
 /* ---------- preview ---------- */
 function clearPreview(){
   if(S.pvUrl){URL.revokeObjectURL(S.pvUrl);S.pvUrl=''}
+  for(var i=0;i<S.bUrls.length;i++){URL.revokeObjectURL(S.bUrls[i])}
+  S.bUrls=[];
   $('pv').innerHTML='';$('pv').className='pv';$('pvnote').textContent='';
   S.imgW=0;S.imgH=0;S.pdfDoc=null;
 }
@@ -1478,6 +1822,25 @@ function startPreview(){
   }else{
     loadPdfPreview(f);
   }
+}
+function renderBatchPreview(){
+  var pv=$('pv');pv.innerHTML='';
+  S.bUrls=[];
+  S.files.forEach(function(f,i){
+    var row=el('div','brow');
+    row.appendChild(el('div','bnum',String(i+1)));
+    if(kindOf(f)==='image'){
+      var im=document.createElement('img');
+      var u=URL.createObjectURL(f);S.bUrls.push(u);
+      im.loading='lazy';im.className='bth';im.src=u;
+      row.appendChild(im);
+    }else{
+      row.appendChild(el('div','bth bpdf','PDF'));
+    }
+    row.appendChild(el('div','bnm',f.name));
+    pv.appendChild(row);
+  });
+  updatePreview();
 }
 function paperDims(){
   var id=$('paper').value;
@@ -1509,6 +1872,10 @@ function renderImagePreview(){
 }
 function updatePreview(){
   $('pv').className='pv'+(S.color==='mono'?' gray':'');
+  if(S.batch){
+    $('pvnote').textContent=S.files.length+' files joined into one print job, in this order \u00b7 '+noteText();
+    return;
+  }
   if(!S.cur)return;
   if(kindOf(S.cur)==='image'){renderImagePreview()}
   else if(S.pdfDoc){
@@ -1568,7 +1935,59 @@ function renderPage(pdf,n,last){
 }
 
 /* ---------- print ---------- */
+function printBatch(){
+  var files=S.files.slice();
+  if(files.length<2||!S.caps)return;
+  var o={
+    copies:parseInt($('copies').value,10)||1,
+    color:S.color,
+    paper:$('paper').value,
+    duplex:S.caps.duplex?$('duplex').value:'none',
+    orientation:$('orient').value,
+    scale:$('scale').value,
+    pages:''
+  };
+  if(o.copies<1)o.copies=1;
+  if(o.copies>S.caps.maxCopies){setMsg('dmsg','Maximum copies: '+S.caps.maxCopies,'err');return}
+  var printer=$('printer').value;
+  var ids=[];
+  $('doprint').disabled=true;
+  $('dclose').disabled=true;
+
+  function fin(c,d,pre){
+    $('doprint').disabled=false;
+    $('dclose').disabled=false;
+    if(c===200){setMsg('dmsg','All '+files.length+' files sent to the printer.','ok')}
+    else if(c===0){setMsg('dmsg','Network error.','err')}
+    else if(c===401||c===403){setMsg('dmsg','','')}
+    else{setMsg('dmsg',d.error||pre||'Printing failed.','err')}
+  }
+  function commit(){
+    setMsg('dmsg','Joining and printing '+files.length+' files...','info');
+    req('POST','/api/printbatch',{
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({printer:printer,ids:ids,opts:o})
+    },function(c,d){fin(c,d,'Printing failed.')});
+  }
+  function stage(i){
+    if(i>=files.length){commit();return}
+    var f=files[i];
+    var label='Uploading file '+(i+1)+' of '+files.length;
+    setMsg('dmsg',label+'...','info');
+    req('POST','/api/stage',{
+      headers:{'Content-Type':'application/octet-stream'},
+      body:f,
+      progress:function(e){if(e.lengthComputable)setMsg('dmsg',label+'... '+Math.round(e.loaded/e.total*100)+'%','info')}
+    },function(c,d){
+      if(c===200&&d.id){ids.push(d.id);stage(i+1)}
+      else{fin(c,d,'Could not upload '+f.name)}
+    });
+  }
+  stage(0);
+}
+
 $('doprint').onclick=function(){
+  if(S.batch){printBatch();return}
   var f=S.cur;
   if(!f||!S.caps)return;
   var isPdf=kindOf(f)==='pdf';
