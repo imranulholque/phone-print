@@ -671,11 +671,14 @@ func sentSummary(o printOpts, c printerCaps) string {
 		col = "black & white"
 	}
 	d := "one-sided"
+// always send the duplex choice, so the driver default never decides
 	switch o.Duplex {
 	case "long":
-		d = "two-sided (long edge)"
+		p = append(p, "duplexlong")
 	case "short":
-		d = "two-sided (short edge)"
+		p = append(p, "duplexshort")
+	default:
+		p = append(p, "noduplex")
 	}
 	src := "default tray"
 	for _, sc := range c.Sources {
